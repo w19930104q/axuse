@@ -17,6 +17,8 @@
  *    /ats/*               fixture ATS: nested iframes, screening tree, review
  *    /commerce/*          fixture store admin: grid, listing form, disputes
  *    /maps/*              fixture maps tenant: virtualized feed, detail cards
+ *    /jobs/board          fixture recruitment board: virtualized infinite
+ *                         list (data-record-id rows, sentinel, DOM reset)
  */
 
 import http from "node:http";
@@ -680,6 +682,102 @@ export function startFixtureServer({ port = 0 } = {}) {
             <dt>Hours</dt><dd id="hours">${r.hours ?? ""}</dd>
             <dt>Rating</dt><dd id="rating">${r.rating ?? ""} (${r.reviewCount ?? ""} reviews)</dd>
           </dl>`));
+      }
+
+      /* ----------------------------------- jobs board (list-harvest) */
+      if (p === "/jobs/board") {
+        // A recruitment board as a VIRTUALIZED infinite list: the DOM only
+        // holds the window around the scroll offset (old rows are recycled),
+        // records load in async batches, and a sentinel marks the end.
+        //   ?reset_after=N  once N records are known, the list DOM resets
+        //                   (container emptied, scroll jumps to top) — the
+        //                   harvester must resume from its cursor depth
+        //   ?stall_at=N     loading stops at N records, no sentinel ever
+        //                   (the "no new records" termination path)
+        // Planted honesty cases: record 26 is a repost of job-0010 (same
+        // data-record-id, different title — dedupe keeps the first), and
+        // record 42 is a broken card (no title, no link — diagnostic only).
+        const resetAfter = Math.max(0, Number(url.searchParams.get("reset_after")) || 0);
+        const stallAt = Math.max(0, Number(url.searchParams.get("stall_at")) || 0);
+        return send(res, 200, PAGE("Fixture jobs board", `
+          <h1>Open positions</h1>
+          <div id="board" style="height:480px;width:720px;overflow-y:auto;border:1px solid #ccc">
+            <div id="canvas" style="position:relative"></div>
+          </div>
+          <script>
+            (function(){
+              var TOTAL = 120, ROW_H = 48, BATCH = 12, BUFFER = 4;
+              var RESET_AFTER = ${resetAfter} || Infinity;
+              var STALL_AT = ${stallAt} || Infinity;
+              var loaded = 0, loading = false, resetDone = false;
+              var board = document.getElementById("board");
+              var canvas = document.getElementById("canvas");
+              function recordFor(n){ // n is 1-based
+                if (n === 26) return { id: "job-0010", title: "Frontend Engineer 26 (reposted)", company: "Acme Corp 1", location: "Berlin" };
+                if (n === 42) return { id: "job-0042", broken: true };
+                var id = "job-" + String(n).padStart(4, "0");
+                return { id: id, title: "Frontend Engineer " + n, company: "Acme Corp " + (n % 9), location: ["Berlin", "Paris", "Remote"][n % 3] };
+              }
+              function rowEl(n){
+                var r = recordFor(n);
+                var el = document.createElement("div");
+                el.className = "job-row";
+                el.setAttribute("data-record-id", r.id);
+                el.style.cssText = "position:absolute;left:0;right:0;top:" + ((n - 1) * ROW_H) + "px;height:" + ROW_H + "px";
+                if (r.broken) {
+                  el.innerHTML = '<span class="job-company" data-field="company"></span>';
+                } else {
+                  el.innerHTML = '<a class="job-title" data-field="title" href="/jobs/posting?id=' + r.id + '">' + r.title + "</a>"
+                    + ' <span class="job-company" data-field="company">' + r.company + "</span>"
+                    + ' <span class="job-location" data-field="location">' + r.location + "</span>";
+                }
+                return el;
+              }
+              function sentinelEl(){
+                var s = document.createElement("div");
+                s.id = "sentinel";
+                s.setAttribute("data-list-sentinel", "");
+                s.textContent = "end of list";
+                s.style.cssText = "position:absolute;left:0;right:0;top:" + (TOTAL * ROW_H) + "px;height:" + ROW_H + "px";
+                return s;
+              }
+              function render(){
+                var first = Math.max(1, Math.floor(board.scrollTop / ROW_H) - BUFFER + 1);
+                var last = Math.min(loaded, Math.ceil((board.scrollTop + board.clientHeight) / ROW_H) + BUFFER);
+                var withSentinel = loaded >= TOTAL && STALL_AT === Infinity;
+                canvas.style.height = (loaded * ROW_H + (withSentinel ? ROW_H : 0)) + "px";
+                canvas.innerHTML = "";
+                for (var n = first; n <= last; n++) canvas.appendChild(rowEl(n));
+                if (withSentinel) canvas.appendChild(sentinelEl());
+              }
+              function maybeLoad(){
+                if (loading || loaded >= Math.min(TOTAL, STALL_AT)) return;
+                if (board.scrollTop + board.clientHeight < loaded * ROW_H - 2 * ROW_H) return;
+                loading = true;
+                setTimeout(function(){
+                  loaded = Math.min(loaded + BATCH, TOTAL, STALL_AT);
+                  loading = false;
+                  render();
+                  // The planted DOM reset: once RESET_AFTER records are known,
+                  // the list tears its DOM down and jumps to the top — once.
+                  if (!resetDone && loaded >= RESET_AFTER) {
+                    resetDone = true;
+                    canvas.innerHTML = "";
+                    board.scrollTop = 0;
+                    render();
+                  }
+                }, 30);
+              }
+              board.addEventListener("scroll", function(){ render(); maybeLoad(); });
+              loaded = Math.min(BATCH, TOTAL, STALL_AT);
+              render();
+              maybeLoad();
+            })();
+          </script>`));
+      }
+      if (p === "/jobs/posting") {
+        const id = url.searchParams.get("id") || "";
+        return send(res, 200, PAGE(`Posting ${id}`, `<h1>Posting ${id}</h1><p>Fixture job detail page.</p>`));
       }
 
       /* ------------------------------------------------ static files */

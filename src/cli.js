@@ -7,11 +7,12 @@
  *   axuse doctor       environment + smoke-test check
  *   axuse setup        guided native-host + extension setup
  *   axuse open-urls    bounded URL inspection report
+ *   axuse harvest-list resumable virtual-list collection (data-record-id rows)
  *   axuse help
  */
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { locateBrowser } from "./core/cdp.js";
 import { Controller } from "./core/controller.js";
@@ -42,6 +43,11 @@ Usage:
   axuse setup [--browser chrome|edge|chromium|chrome-for-testing]
                                               register bridge + open extension setup
   axuse open-urls <file|url|->                 inspect a URL list and write Markdown
+  axuse harvest-list <url>                    resumable virtual-list collection
+                                              (data-record-id rows → JSON)
+      [--max-records N] [--max-steps N] [--stagnant-limit N]
+      [--sentinel SELECTOR] [--step-ms N] [--resume STATE.json]
+      [--output FILE] [--headless] [--backend cdp|extension]
   axuse plugins                               list loaded solver plugins
   axuse solve <provider> [--url URL]          run a loaded solver (e.g. turnstile)
                                               [--headless] [--max-attempts N] [--deadline-ms N]
@@ -108,7 +114,7 @@ function numberArg(name) {
 }
 
 function positionalArgs() {
-  const valueFlags = new Set(["--browser", "--harness", "--backend", "--output", "--settle-ms", "--excerpt-chars", "--timeout-ms"]);
+  const valueFlags = new Set(["--browser", "--harness", "--backend", "--output", "--settle-ms", "--excerpt-chars", "--timeout-ms", "--max-records", "--max-steps", "--stagnant-limit", "--sentinel", "--step-ms", "--resume"]);
   const out = [];
   for (let i = 0; i < rest.length; i++) {
     const token = rest[i];
@@ -226,6 +232,53 @@ async function openUrlsCmd() {
   writeFileSync(output, renderUrlReport({ results: batch.results, backend, source }) + "\n");
   console.log(`Wrote ${batch.opened}/${batch.count} opened URL results to ${resolve(output)}`);
   if (batch.failed) console.log(`${batch.failed} URL${batch.failed === 1 ? "" : "s"} failed; see the report for details.`);
+}
+
+async function harvestListCmd() {
+  const url = positionalArgs()[0];
+  if (!url) throw new Error("harvest-list requires a URL, e.g. axuse harvest-list https://jobs.example/board --output jobs.json");
+  const backend = arg("--backend") ?? "cdp";
+  if (!["cdp", "extension"].includes(backend)) throw new Error("--backend must be cdp or extension");
+  const { harvestList, serializeHarvest } = await import("./workflows/list-harvest.js");
+  let resume = null;
+  if (arg("--resume")) {
+    try {
+      resume = JSON.parse(readFileSync(arg("--resume"), "utf8"));
+    } catch (e) {
+      throw new Error(`--resume: could not read state file ${arg("--resume")}: ${e.message}`);
+    }
+  }
+  const controller = new Controller();
+  let tabId = null;
+  try {
+    const opened = await controller.execute("open", {
+      url,
+      backend,
+      headless: hasFlag("--headless") ? true : undefined,
+      settle_ms: numberArg("--settle-ms") ?? 500,
+    });
+    tabId = opened.tab_id;
+    const { state, stopReason } = await harvestList(controller, {
+      tabId,
+      resume,
+      maxRecords: numberArg("--max-records"),
+      maxSteps: numberArg("--max-steps"),
+      stagnantLimit: numberArg("--stagnant-limit"),
+      sentinelSelector: arg("--sentinel"),
+      settleMs: numberArg("--step-ms"),
+    });
+    const doc = serializeHarvest(state, { source: url, stopReason });
+    const output = arg("--output") ?? "axuse-harvest.json";
+    writeFileSync(output, JSON.stringify(doc, null, 2) + "\n");
+    const s = doc.stats;
+    console.log(`harvest: ${doc.count} records (${stopReason}; ${s.steps} steps, ${s.duplicates_skipped} duplicates skipped, ${s.bad_rows} bad row${s.bad_rows === 1 ? "" : "s"}, ${s.dom_resets} DOM reset${s.dom_resets === 1 ? "" : "s"}) → ${resolve(output)}`);
+    if (doc.diagnostics.length) console.log(`diagnostics: ${doc.diagnostics.length} entr${doc.diagnostics.length === 1 ? "y" : "ies"} (see the output file; bad rows never fail a run)`);
+    if (stopReason !== "sentinel") console.log(`note: stopped by ${stopReason} — resume later with: axuse harvest-list ${url} --resume ${resolve(output)}`);
+  } finally {
+    // The tab and browser this command created leave with it.
+    if (tabId) { try { await controller.execute("close", { tab_id: tabId }); } catch {} }
+    await Promise.race([controller.dispose(), new Promise((ok) => setTimeout(ok, 5000))]);
+  }
 }
 
 async function pluginsCmd() {
@@ -668,6 +721,9 @@ try {
       break;
     case "open-urls":
       await openUrlsCmd();
+      break;
+    case "harvest-list":
+      await harvestListCmd();
       break;
     case "bridge":
       await bridgeCmd(rest[0]);

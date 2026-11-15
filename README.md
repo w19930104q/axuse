@@ -406,6 +406,24 @@ The generated report is intentionally honest: it contains page titles, access
 status, and bounded accessibility-text excerpts, not fabricated semantic
 summaries.
 
+For **virtualized lists** (recruitment boards, infinite feeds — where the DOM
+only holds the rows around the viewport and a single snapshot misses almost
+everything), there is a resumable collector:
+
+```bash
+node src/cli.js harvest-list https://jobs.example/board --output jobs.json
+node src/cli.js harvest-list https://jobs.example/board --resume jobs.json   # continue an interrupted run
+```
+
+Rows are identified by their stable `data-record-id` (de-duplicated, kept in
+first-seen order — a reposted card never overwrites the first sighting); each
+record carries title, company, location and url. The run ends at the list
+sentinel, when no new records appear, or at `--max-records` — whichever comes
+first. If the list's DOM resets mid-run (or a later run resumes from the
+output file), collection continues from the cursor depth instead of starting
+over. A row that does not parse is a diagnostic entry in the output, never a
+failed run. The tab and browser the command opens are closed when it exits.
+
 ## Development
 
 ```bash
